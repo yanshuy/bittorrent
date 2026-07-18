@@ -1,10 +1,12 @@
 import bencode
+import gleam/bit_array
 import gleam/crypto
 import gleam/dict
 import gleam/list
-import gleam/result.{try}
-import gleam/set
-import torrent/peer/protocol
+import gleam/pair
+import gleam/result.{replace_error, try}
+import gleam/string
+import gleam/uri
 
 pub type TorrentInfo {
   TorrentInfo(
@@ -20,7 +22,10 @@ pub type TorrentInfo {
 pub fn parse(
   meta_info: bencode.Bencode,
 ) -> Result(TorrentInfo, bencode.BencodeError) {
-  use dict <- try(bencode.dict(meta_info))
+  use dict <- try(
+    bencode.dict(meta_info)
+    |> replace_error(bencode.InvalidTorrent("expected meta info to be a dict")),
+  )
 
   let name = bencode.get_string(dict, "name") |> result.unwrap("Unknown")
   use announce <- try(bencode.get_string(dict, "announce"))
@@ -41,6 +46,44 @@ pub fn parse(
     pieces: split_piece_hashes(pieces),
     info_hash: info_hash(info_entries),
   ))
+}
+
+pub type MagnetInfo {
+  MagnetInfo(announce: String, info_hash: BitArray)
+}
+
+pub fn parse_magnet(magnet_link: String) -> Result(MagnetInfo, String) {
+  use #(_, query_param) <- try(
+    string.split_once(magnet_link, "?")
+    |> replace_error("invalid magnet link"),
+  )
+
+  use dict <- try(
+    query_param
+    |> string.split("&")
+    |> list.try_map(string.split_once(_, "="))
+    |> replace_error("invalid magnet link")
+    |> result.map(dict.from_list),
+  )
+
+  use tr <- try(
+    dict.get(dict, "tr") |> replace_error("'tr' (Tracker URL) is missing"),
+  )
+  use announce <- try(
+    uri.percent_decode(tr) |> replace_error("invalid 'tr' (Tracker URL)"),
+  )
+
+  use xt <- try(
+    dict.get(dict, "xt") |> replace_error("'xt' (Info Hash) is missing"),
+  )
+  use info_hash <- try(
+    string.split_once(xt, "urn:btih:")
+    |> result.map(pair.second)
+    |> result.try(bit_array.base16_decode)
+    |> replace_error("invalid 'xt' (Info Hash)"),
+  )
+
+  MagnetInfo(announce: announce, info_hash: info_hash) |> Ok
 }
 
 pub fn info_hash(info_entries: List(#(String, bencode.Bencode))) -> BitArray {
@@ -72,15 +115,6 @@ pub type PieceInfo {
   PieceInfo(index: Int, hash: BitArray, length: Int)
 }
 
-pub type Torrent {
-  Torrent(
-    info: TorrentInfo,
-    download_path: String,
-    peers: set.Set(protocol.PeerId),
-    pending_pieces: List(PieceInfo),
-  )
-}
-
 pub const block_size = 16_384
 
 pub fn new_pieces(
@@ -101,12 +135,12 @@ fn new_pieces_loop(
   case hashes {
     [] -> acc
 
-    [last_hash] -> {
+    [hash] -> {
       let length = case file_length % piece_length {
         0 -> piece_length
         rem -> rem
       }
-      let piece = PieceInfo(index: index, hash: last_hash, length: length)
+      let piece = PieceInfo(index: index, hash: hash, length: length)
       list.reverse([piece, ..acc])
     }
 

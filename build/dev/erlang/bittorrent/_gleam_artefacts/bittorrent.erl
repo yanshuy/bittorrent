@@ -1,7 +1,7 @@
 -module(bittorrent).
 -compile([no_auto_import, nowarn_unused_vars, nowarn_unused_function, nowarn_nomatch, inline]).
 -define(FILEPATH, "src/bittorrent.gleam").
--export([stop/1, parse_magnet/1, execute_cmd/1, execute/1, main/0]).
+-export([stop/1, execute_cmd/1, execute/1, main/0]).
 -export_type([cmd_error/0, application/0, start_error/0]).
 
 -type cmd_error() :: {unknown_command, binary()} |
@@ -15,18 +15,19 @@
     {tracker_error, tracker:tracker_error()} |
     {protocol_error, torrent@peer@protocol:protocol_error()} |
     {peer_error, torrent@peer@session:peer_error()} |
-    {torrent_error, torrent@download:torrent_error()}.
+    {torrent_error, torrent@download:torrent_error()} |
+    {cmd_error, binary()}.
 
 -type application() :: inets | crypto | asn1 | public_key | ssl.
 
 -type start_error() :: {start_error, binary()}.
 
--file("src/bittorrent.gleam", 310).
+-file("src/bittorrent.gleam", 375).
 -spec stop(integer()) -> nil.
 stop(Code) ->
     init:stop(Code).
 
--file("src/bittorrent.gleam", 291).
+-file("src/bittorrent.gleam", 355).
 -spec describe_cmd_error(cmd_error()) -> binary().
 describe_cmd_error(Error) ->
     case Error of
@@ -66,74 +67,13 @@ describe_cmd_error(Error) ->
             torrent@peer@protocol:describe_error(Err@4);
 
         {torrent_error, Err@5} ->
-            torrent@download:describe_error(Err@5)
+            torrent@download:describe_error(Err@5);
+
+        {cmd_error, Err@6} ->
+            Err@6
     end.
 
--file("src/bittorrent.gleam", 264).
--spec parse_magnet(binary()) -> {ok, gleam@dict:dict(binary(), binary())} |
-    {error, nil}.
-parse_magnet(Magnet_link) ->
-    gleam@result:'try'(
-        gleam@string:split_once(Magnet_link, <<"?"/utf8>>),
-        fun(_use0) ->
-            {_, Query_param} = _use0,
-            _pipe = Query_param,
-            _pipe@1 = gleam@string:split(_pipe, <<"&"/utf8>>),
-            _pipe@2 = gleam@list:try_map(
-                _pipe@1,
-                fun(_capture) ->
-                    gleam@string:split_once(_capture, <<"="/utf8>>)
-                end
-            ),
-            gleam@result:map(_pipe@2, fun maps:from_list/1)
-        end
-    ).
-
--file("src/bittorrent.gleam", 227).
--spec cmd_parse_magnet(binary()) -> {ok, nil} | {error, cmd_error()}.
-cmd_parse_magnet(Magnet_link) ->
-    echo(<<"hloeafafaade"/utf8>>, nil, 228),
-    gleam@result:'try'(
-        begin
-            _pipe = parse_magnet(Magnet_link),
-            gleam@result:replace_error(_pipe, invalid_magnet_link)
-        end,
-        fun(Magnet_info_dict) ->
-            Tr = gleam_stdlib:map_get(Magnet_info_dict, <<"tr"/utf8>>),
-            case Tr of
-                {ok, Url} ->
-                    gleam_stdlib:println(<<"Tracker URL: "/utf8, Url/binary>>);
-
-                {error, _} ->
-                    gleam_stdlib:print_error(
-                        <<"Error: 'tr' (Tracker URL) is missing."/utf8>>
-                    )
-            end,
-            Xt = gleam_stdlib:map_get(Magnet_info_dict, <<"xt"/utf8>>),
-            case Xt of
-                {ok, Urn} ->
-                    Hash@1 = case gleam@string:split_once(
-                        Urn,
-                        <<"urn:btih:"/utf8>>
-                    ) of
-                        {ok, Hash} ->
-                            erlang:element(2, Hash);
-
-                        {error, _} ->
-                            Urn
-                    end,
-                    gleam_stdlib:println(<<"Info Hash: "/utf8, Hash@1/binary>>);
-
-                {error, _} ->
-                    gleam_stdlib:print_error(
-                        <<"Error: 'xt' (Info Hash) is missing."/utf8>>
-                    )
-            end,
-            {ok, nil}
-        end
-    ).
-
--file("src/bittorrent.gleam", 138).
+-file("src/bittorrent.gleam", 150).
 -spec new_endpoint(binary()) -> {ok, torrent@peer@protocol:endpoint()} |
     {error, nil}.
 new_endpoint(Endpoint) ->
@@ -148,7 +88,257 @@ new_endpoint(Endpoint) ->
             {error, nil}
     end.
 
--file("src/bittorrent.gleam", 97).
+-file("src/bittorrent.gleam", 326).
+-spec load_peer_id() -> {ok, torrent@peer@protocol:peer_id()} |
+    {error, simplifile:file_error()}.
+load_peer_id() ->
+    case simplifile_erl:read_bits(<<".peer_id"/utf8>>) of
+        {ok, Peer_id} ->
+            {ok, {peer_id, Peer_id}};
+
+        _ ->
+            Peer_id@1 = crypto:strong_rand_bytes(20),
+            gleam@result:'try'(
+                simplifile_erl:write_bits(<<".peer_id"/utf8>>, Peer_id@1),
+                fun(_) -> {ok, {peer_id, Peer_id@1}} end
+            )
+    end.
+
+-file("src/bittorrent.gleam", 264).
+-spec cmd_magnet_handshake(binary()) -> {ok, nil} | {error, cmd_error()}.
+cmd_magnet_handshake(Magnet_link) ->
+    gleam@result:'try'(
+        begin
+            _pipe = load_peer_id(),
+            gleam@result:map_error(
+                _pipe,
+                fun(Field@0) -> {file_error, Field@0} end
+            )
+        end,
+        fun(Peer_id) ->
+            gleam@result:'try'(
+                begin
+                    _pipe@1 = torrent@torrent:parse_magnet(Magnet_link),
+                    gleam@result:replace_error(_pipe@1, invalid_magnet_link)
+                end,
+                fun(Magnet_info) ->
+                    gleam@result:'try'(
+                        begin
+                            _pipe@2 = tracker:get_peers(
+                                erlang:element(2, Magnet_info),
+                                erlang:element(3, Magnet_info),
+                                10,
+                                Peer_id
+                            ),
+                            gleam@result:map_error(
+                                _pipe@2,
+                                fun(Field@0) -> {tracker_error, Field@0} end
+                            )
+                        end,
+                        fun(Peers) ->
+                            gleam@bool:lazy_guard(
+                                gleam@list:is_empty(Peers),
+                                fun() ->
+                                    gleam_stdlib:println(<<"No peers"/utf8>>),
+                                    {ok, nil}
+                                end,
+                                fun() ->
+                                    First@1 = case Peers of
+                                        [First | _] -> First;
+                                        _assert_fail ->
+                                            erlang:error(
+                                                    #{gleam_error => let_assert,
+                                                        message => <<"Pattern match failed, no pattern matched the value."/utf8>>,
+                                                        file => <<?FILEPATH/utf8>>,
+                                                        module => <<"bittorrent"/utf8>>,
+                                                        function => <<"cmd_magnet_handshake"/utf8>>,
+                                                        line => 278,
+                                                        value => _assert_fail,
+                                                        start => 7139,
+                                                        'end' => 7169,
+                                                        pattern_start => 7150,
+                                                        pattern_end => 7161}
+                                                )
+                                    end,
+                                    gleam@result:'try'(
+                                        begin
+                                            _pipe@3 = new_endpoint(First@1),
+                                            gleam@result:replace_error(
+                                                _pipe@3,
+                                                invalid_endpoint
+                                            )
+                                        end,
+                                        fun(Endpoint) ->
+                                            gleam@result:'try'(
+                                                begin
+                                                    _pipe@4 = torrent@peer@protocol:handshake(
+                                                        Endpoint,
+                                                        erlang:element(
+                                                            3,
+                                                            Magnet_info
+                                                        ),
+                                                        Peer_id
+                                                    ),
+                                                    gleam@result:map_error(
+                                                        _pipe@4,
+                                                        fun(Field@0) -> {protocol_error, Field@0} end
+                                                    )
+                                                end,
+                                                fun(_use0) ->
+                                                    {Socket, Peer_peer_id, _} = _use0,
+                                                    Session = torrent@peer@session:new_session(
+                                                        Socket,
+                                                        Peer_peer_id
+                                                    ),
+                                                    gleam@result:'try'(
+                                                        begin
+                                                            _pipe@5 = torrent@peer@session:receive_bitfield(
+                                                                Session
+                                                            ),
+                                                            gleam@result:map_error(
+                                                                _pipe@5,
+                                                                fun(Field@0) -> {peer_error, Field@0} end
+                                                            )
+                                                        end,
+                                                        fun(Session@1) ->
+                                                            gleam@result:'try'(
+                                                                begin
+                                                                    _pipe@6 = torrent@peer@protocol:send_extended_handshake(
+                                                                        erlang:element(
+                                                                            2,
+                                                                            Session@1
+                                                                        )
+                                                                    ),
+                                                                    gleam@result:map_error(
+                                                                        _pipe@6,
+                                                                        fun(Field@0) -> {protocol_error, Field@0} end
+                                                                    )
+                                                                end,
+                                                                fun(_) ->
+                                                                    gleam@result:'try'(
+                                                                        begin
+                                                                            _pipe@7 = torrent@peer@session:receive_until(
+                                                                                erlang:element(
+                                                                                    2,
+                                                                                    Session@1
+                                                                                ),
+                                                                                fun(
+                                                                                    Message
+                                                                                ) ->
+                                                                                    echo(
+                                                                                        Message,
+                                                                                        nil,
+                                                                                        295
+                                                                                    ),
+                                                                                    case Message of
+                                                                                        {extension,
+                                                                                            {handshake,
+                                                                                                Extensions}} ->
+                                                                                            {ok,
+                                                                                                Extensions};
+
+                                                                                        _ ->
+                                                                                            {error,
+                                                                                                nil}
+                                                                                    end
+                                                                                end
+                                                                            ),
+                                                                            gleam@result:map_error(
+                                                                                _pipe@7,
+                                                                                fun(Field@0) -> {peer_error, Field@0} end
+                                                                            )
+                                                                        end,
+                                                                        fun(
+                                                                            Extension
+                                                                        ) ->
+                                                                            gleam@result:'try'(
+                                                                                begin
+                                                                                    _pipe@8 = Extension,
+                                                                                    _pipe@9 = gleam@list:key_find(
+                                                                                        _pipe@8,
+                                                                                        <<"ut_metadata"/utf8>>
+                                                                                    ),
+                                                                                    gleam@result:replace_error(
+                                                                                        _pipe@9,
+                                                                                        {cmd_error,
+                                                                                            <<"ut_metadata not found in extensions"/utf8>>}
+                                                                                    )
+                                                                                end,
+                                                                                fun(
+                                                                                    Metadata_extension_id
+                                                                                ) ->
+                                                                                    {peer_id,
+                                                                                        Id} = Peer_peer_id,
+                                                                                    gleam_stdlib:println(
+                                                                                        <<"Peer ID: "/utf8,
+                                                                                            (begin
+                                                                                                _pipe@10 = Id,
+                                                                                                _pipe@11 = gleam_stdlib:base16_encode(
+                                                                                                    _pipe@10
+                                                                                                ),
+                                                                                                string:lowercase(
+                                                                                                    _pipe@11
+                                                                                                )
+                                                                                            end)/binary>>
+                                                                                    ),
+                                                                                    gleam_stdlib:println(
+                                                                                        <<"Peer Metadata Extension ID: "/utf8,
+                                                                                            (begin
+                                                                                                _pipe@12 = Metadata_extension_id,
+                                                                                                erlang:integer_to_binary(
+                                                                                                    _pipe@12
+                                                                                                )
+                                                                                            end)/binary>>
+                                                                                    ),
+                                                                                    {ok,
+                                                                                        nil}
+                                                                                end
+                                                                            )
+                                                                        end
+                                                                    )
+                                                                end
+                                                            )
+                                                        end
+                                                    )
+                                                end
+                                            )
+                                        end
+                                    )
+                                end
+                            )
+                        end
+                    )
+                end
+            )
+        end
+    ).
+
+-file("src/bittorrent.gleam", 250).
+-spec cmd_parse_magnet(binary()) -> {ok, nil} | {error, cmd_error()}.
+cmd_parse_magnet(Magnet_link) ->
+    gleam@result:'try'(
+        begin
+            _pipe = torrent@torrent:parse_magnet(Magnet_link),
+            gleam@result:replace_error(_pipe, invalid_magnet_link)
+        end,
+        fun(Magnet_info) ->
+            gleam_stdlib:println(
+                <<"Tracker URL: "/utf8,
+                    (erlang:element(2, Magnet_info))/binary>>
+            ),
+            gleam_stdlib:println(
+                <<"Info Hash: "/utf8,
+                    (begin
+                        _pipe@1 = erlang:element(3, Magnet_info),
+                        _pipe@2 = gleam_stdlib:base16_encode(_pipe@1),
+                        string:lowercase(_pipe@2)
+                    end)/binary>>
+            ),
+            {ok, nil}
+        end
+    ).
+
+-file("src/bittorrent.gleam", 103).
 -spec info(binary()) -> {ok, torrent@torrent:torrent_info()} |
     {error, cmd_error()}.
 info(Filename) ->
@@ -178,23 +368,7 @@ info(Filename) ->
         end
     ).
 
--file("src/bittorrent.gleam", 252).
--spec load_peer_id() -> {ok, torrent@peer@protocol:peer_id()} |
-    {error, simplifile:file_error()}.
-load_peer_id() ->
-    case simplifile_erl:read_bits(<<".peer_id"/utf8>>) of
-        {ok, Peer_id} ->
-            {ok, {peer_id, Peer_id}};
-
-        _ ->
-            Peer_id@1 = crypto:strong_rand_bytes(20),
-            gleam@result:'try'(
-                simplifile_erl:write_bits(<<".peer_id"/utf8>>, Peer_id@1),
-                fun(_) -> {ok, {peer_id, Peer_id@1}} end
-            )
-    end.
-
--file("src/bittorrent.gleam", 204).
+-file("src/bittorrent.gleam", 221).
 -spec cmd_download(binary(), binary()) -> {ok, nil} | {error, cmd_error()}.
 cmd_download(Download_path, Torrent_file) ->
     gleam@result:'try'(
@@ -211,7 +385,12 @@ cmd_download(Download_path, Torrent_file) ->
                 fun(Torrent) ->
                     gleam@result:'try'(
                         begin
-                            _pipe@1 = tracker:get_peers(Torrent, Peer_id),
+                            _pipe@1 = tracker:get_peers(
+                                erlang:element(3, Torrent),
+                                erlang:element(7, Torrent),
+                                erlang:element(4, Torrent),
+                                Peer_id
+                            ),
                             gleam@result:map_error(
                                 _pipe@1,
                                 fun(Field@0) -> {tracker_error, Field@0} end
@@ -256,7 +435,7 @@ cmd_download(Download_path, Torrent_file) ->
         end
     ).
 
--file("src/bittorrent.gleam", 167).
+-file("src/bittorrent.gleam", 179).
 -spec cmd_download_piece(binary(), binary(), binary()) -> {ok, nil} |
     {error, cmd_error()}.
 cmd_download_piece(Download_path, Torrent_file, Piece_index_str) ->
@@ -281,7 +460,9 @@ cmd_download_piece(Download_path, Torrent_file, Piece_index_str) ->
                             gleam@result:'try'(
                                 begin
                                     _pipe@2 = tracker:get_peers(
-                                        Torrent,
+                                        erlang:element(3, Torrent),
+                                        erlang:element(7, Torrent),
+                                        erlang:element(4, Torrent),
                                         Peer_id
                                     ),
                                     gleam@result:map_error(
@@ -367,7 +548,7 @@ cmd_download_piece(Download_path, Torrent_file, Piece_index_str) ->
         end
     ).
 
--file("src/bittorrent.gleam", 148).
+-file("src/bittorrent.gleam", 160).
 -spec cmd_handshake(binary(), binary()) -> {ok, nil} | {error, cmd_error()}.
 cmd_handshake(Filename, Endpoint) ->
     gleam@result:'try'(
@@ -404,7 +585,7 @@ cmd_handshake(Filename, Endpoint) ->
                                     )
                                 end,
                                 fun(_use0) ->
-                                    {_, Peer_peer_id} = _use0,
+                                    {_, Peer_peer_id, _} = _use0,
                                     {peer_id, Id} = Peer_peer_id,
                                     gleam_stdlib:println(
                                         <<"Peer ID: "/utf8,
@@ -426,7 +607,7 @@ cmd_handshake(Filename, Endpoint) ->
         end
     ).
 
--file("src/bittorrent.gleam", 127).
+-file("src/bittorrent.gleam", 133).
 -spec cmd_peers(binary()) -> {ok, nil} | {error, cmd_error()}.
 cmd_peers(Filename) ->
     gleam@result:'try'(
@@ -443,7 +624,12 @@ cmd_peers(Filename) ->
                 fun(Torrent) ->
                     gleam@result:'try'(
                         begin
-                            _pipe@1 = tracker:get_peers(Torrent, Peer_id),
+                            _pipe@1 = tracker:get_peers(
+                                erlang:element(3, Torrent),
+                                erlang:element(7, Torrent),
+                                erlang:element(4, Torrent),
+                                Peer_id
+                            ),
                             gleam@result:map_error(
                                 _pipe@1,
                                 fun(Field@0) -> {tracker_error, Field@0} end
@@ -461,7 +647,7 @@ cmd_peers(Filename) ->
         end
     ).
 
--file("src/bittorrent.gleam", 104).
+-file("src/bittorrent.gleam", 110).
 -spec cmd_info(binary()) -> {ok, nil} | {error, cmd_error()}.
 cmd_info(Filename) ->
     gleam@result:'try'(
@@ -498,7 +684,7 @@ cmd_info(Filename) ->
         end
     ).
 
--file("src/bittorrent.gleam", 86).
+-file("src/bittorrent.gleam", 92).
 -spec cmd_decode(binary()) -> {ok, nil} | {error, cmd_error()}.
 cmd_decode(Encode_str) ->
     gleam@result:'try'(
@@ -594,11 +780,21 @@ execute_cmd(Args) ->
                     {error, {insufficient_arguments, <<"magnet_parse"/utf8>>}}
             end;
 
+        [<<"magnet_handshake"/utf8>> | Rest@7] ->
+            case Rest@7 of
+                [Magnet_link@1] ->
+                    cmd_magnet_handshake(Magnet_link@1);
+
+                _ ->
+                    {error,
+                        {insufficient_arguments, <<"magnet_handshake"/utf8>>}}
+            end;
+
         [Command | _] ->
             {error, {unknown_command, Command}}
     end.
 
--file("src/bittorrent.gleam", 327).
+-file("src/bittorrent.gleam", 392).
 -spec start(list(application())) -> nil.
 start(Apps) ->
     gleam@list:each(Apps, fun(App) -> case bittorrent_ffi:start(App) of

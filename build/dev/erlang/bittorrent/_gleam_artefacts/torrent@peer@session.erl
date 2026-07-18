@@ -1,35 +1,42 @@
 -module(torrent@peer@session).
 -compile([no_auto_import, nowarn_unused_vars, nowarn_unused_function, nowarn_nomatch, inline]).
 -define(FILEPATH, "src/torrent/peer/session.gleam").
--export([piece_block_requests/1, new_piece_download/1, new_session/2, describe_error/1, is_any_bit_set/1, start_session/3, download_piece/3]).
--export_type([piece_download/0, peer_session/0, block_request/0, piece_result/0, peer_error/0]).
+-export([piece_block_requests/1, new_piece_download/1, new_session/2, describe_error/1, is_any_bit_set/1, start_session/4, receive_until/2, wait_unchoke/1, receive_bitfield/1, download_piece/3]).
+-export_type([piece_download/0, state/0, peer_session/0, reader_message/0, session_message/0, block_request/0, peer_error/0]).
 
 -type piece_download() :: {piece_download,
-        torrent@torrent:piece_info(),
+        integer(),
+        integer(),
         gleam@dict:dict(integer(), bitstring()),
         list(block_request()),
         gleam@dict:dict(integer(), block_request())}.
 
+-type state() :: no_piece | await_lease | {download, piece_download()}.
+
 -type peer_session() :: {peer_session,
         mug:socket(),
         torrent@peer@protocol:peer_id(),
-        bitstring(),
-        gleam@option:option(piece_download()),
+        gleam@option:option(bitstring()),
+        gleam@option:option(gleam@dict:dict(binary(), integer())),
+        state(),
         boolean(),
         boolean()}.
 
--type block_request() :: {block_request, integer(), integer()}.
+-type reader_message() :: {message, torrent@peer@protocol:peer_message()} |
+    {read_error, peer_error()}.
 
--type piece_result() :: {piece_result, peer_session(), bitstring()}.
+-type session_message() :: {piece_lease, torrent@torrent:piece_info()} |
+    {reader_message, reader_message()}.
+
+-type block_request() :: {block_request, integer(), integer()}.
 
 -type peer_error() :: {peer_error, binary()} |
     {unexpected_message, integer()} |
     {protocol_error, torrent@peer@protocol:protocol_error()} |
-    piece_hash_mismatch |
     invalid_block |
     duplicate_bitfield.
 
--file("src/torrent/peer/session.gleam", 303).
+-file("src/torrent/peer/session.gleam", 491).
 -spec piece_block_requests_loop(integer(), integer(), list(block_request())) -> list(block_request()).
 piece_block_requests_loop(Length, Block, Requests) ->
     case Block < 0 of
@@ -43,7 +50,7 @@ piece_block_requests_loop(Length, Block, Requests) ->
             Requests
     end.
 
--file("src/torrent/peer/session.gleam", 297).
+-file("src/torrent/peer/session.gleam", 485).
 -spec piece_block_requests(integer()) -> list(block_request()).
 piece_block_requests(Piece_length) ->
     Block_count = case 16384 of
@@ -52,204 +59,80 @@ piece_block_requests(Piece_length) ->
     end,
     piece_block_requests_loop(Piece_length, Block_count - 1, []).
 
--file("src/torrent/peer/session.gleam", 24).
+-file("src/torrent/peer/session.gleam", 27).
 -spec new_piece_download(torrent@torrent:piece_info()) -> piece_download().
 new_piece_download(Piece) ->
     {piece_download,
-        Piece,
+        erlang:element(2, Piece),
+        erlang:element(4, Piece),
         maps:new(),
         piece_block_requests(erlang:element(4, Piece)),
         maps:new()}.
 
--file("src/torrent/peer/session.gleam", 44).
+-file("src/torrent/peer/session.gleam", 55).
 -spec new_session(mug:socket(), torrent@peer@protocol:peer_id()) -> peer_session().
 new_session(Socket, Peer_id) ->
-    {peer_session, Socket, Peer_id, <<>>, none, true, false}.
+    {peer_session, Socket, Peer_id, none, none, no_piece, true, false}.
 
--file("src/torrent/peer/session.gleam", 341).
+-file("src/torrent/peer/session.gleam", 70).
+-spec extended_handshake(mug:socket(), boolean()) -> {ok, nil} |
+    {error, peer_error()}.
+extended_handshake(Socket, Supported) ->
+    case Supported of
+        true ->
+            _pipe = torrent@peer@protocol:send_extended_handshake(Socket),
+            gleam@result:map_error(
+                _pipe,
+                fun(Field@0) -> {protocol_error, Field@0} end
+            );
+
+        false ->
+            {ok, nil}
+    end.
+
+-file("src/torrent/peer/session.gleam", 515).
 -spec describe_error(peer_error()) -> binary().
 describe_error(Error) ->
     case Error of
         {peer_error, Reason} ->
-            <<"Peer connection error: "/utf8, Reason/binary>>;
+            <<"Peer error: "/utf8, Reason/binary>>;
 
         {unexpected_message, Id} ->
-            <<"Received an unexpected protocol message ID: "/utf8,
+            <<"Unexpected message ID: "/utf8,
                 (erlang:integer_to_binary(Id))/binary>>;
 
         {protocol_error, Protocol_err} ->
-            <<"BitTorrent protocol validation failed: "/utf8,
-                (torrent@peer@protocol:describe_error(Protocol_err))/binary>>;
-
-        piece_hash_mismatch ->
-            <<"Data integrity check failed: downloaded piece hash does not match the torrent file info-hash"/utf8>>;
+            torrent@peer@protocol:describe_error(Protocol_err);
 
         invalid_block ->
-            <<"Received an invalid data block length, offset, or payload structural format"/utf8>>;
+            <<"Received an invalid data block length, offset, or payload"/utf8>>;
 
         duplicate_bitfield ->
-            <<"Protocol violation: peer attempted to send a duplicate bitfield message after connection setup"/utf8>>
-    end.
-
--file("src/torrent/peer/session.gleam", 282).
--spec verify_piece(bitstring(), bitstring()) -> {ok, nil} |
-    {error, peer_error()}.
-verify_piece(Binary, Hash) ->
-    Calc = gleam@crypto:hash(sha1, Binary),
-    case Calc =:= Hash of
-        true ->
-            {ok, nil};
-
-        false ->
-            {error, piece_hash_mismatch}
+            <<"Protocol violation: peer sent a second bitfield message"/utf8>>
     end.
 
 -file("src/torrent/peer/session.gleam", 170).
--spec handle_piece_complete(piece_download()) -> {ok, bitstring()} |
-    {error, peer_error()}.
-handle_piece_complete(Piece) ->
-    gleam@result:'try'(
-        begin
-            _pipe = piece_block_requests(
-                erlang:element(4, erlang:element(2, Piece))
-            ),
-            gleam@list:try_map(
-                _pipe,
-                fun(Req) ->
-                    _pipe@1 = gleam_stdlib:map_get(
-                        erlang:element(3, Piece),
-                        erlang:element(2, Req)
-                    ),
-                    gleam@result:replace_error(_pipe@1, invalid_block)
-                end
-            )
-        end,
-        fun(Blocks) ->
-            Data = gleam_stdlib:bit_array_concat(Blocks),
-            gleam@result:'try'(
-                verify_piece(Data, erlang:element(3, erlang:element(2, Piece))),
-                fun(_) -> {ok, Data} end
-            )
-        end
-    ).
+-spec disconnect(
+    gleam@erlang@process:subject(torrent@messages:peer_event()),
+    torrent@peer@protocol:peer_id(),
+    peer_error()
+) -> nil.
+disconnect(Parent_subject, Peer_id, Err) ->
+    gleam@erlang@process:send(
+        Parent_subject,
+        {peer_disconnected, Peer_id, describe_error(Err)}
+    ),
+    gleam@erlang@process:kill(erlang:self()).
 
--file("src/torrent/peer/session.gleam", 239).
--spec handle_piece_block(peer_session(), torrent@peer@protocol:peer_message()) -> {ok,
+-file("src/torrent/peer/session.gleam", 322).
+-spec request_piece_blocks(peer_session(), piece_download()) -> {ok,
         piece_download()} |
     {error, peer_error()}.
-handle_piece_block(Session, Message) ->
-    Piece@1 = case erlang:element(5, Session) of
-        {some, Piece} -> Piece;
-        _assert_fail ->
-            erlang:error(#{gleam_error => let_assert,
-                        message => <<"Pattern match failed, no pattern matched the value."/utf8>>,
-                        file => <<?FILEPATH/utf8>>,
-                        module => <<"torrent/peer/session"/utf8>>,
-                        function => <<"handle_piece_block"/utf8>>,
-                        line => 243,
-                        value => _assert_fail,
-                        start => 6674,
-                        'end' => 6712,
-                        pattern_start => 6685,
-                        pattern_end => 6696})
-    end,
-    {Peer_piece_index@1, Begin@1, Block@1} = case Message of
-        {piece, Peer_piece_index, Begin, Block} -> {
-        Peer_piece_index,
-            Begin,
-            Block};
-        _assert_fail@1 ->
-            erlang:error(#{gleam_error => let_assert,
-                        message => <<"Pattern match failed, no pattern matched the value."/utf8>>,
-                        file => <<?FILEPATH/utf8>>,
-                        module => <<"torrent/peer/session"/utf8>>,
-                        function => <<"handle_piece_block"/utf8>>,
-                        line => 244,
-                        value => _assert_fail@1,
-                        start => 6715,
-                        'end' => 6773,
-                        pattern_start => 6726,
-                        pattern_end => 6763})
-    end,
-    gleam@bool:guard(
-        Peer_piece_index@1 /= erlang:element(2, erlang:element(2, Piece@1)),
-        {error, {peer_error, <<"piece index mismatch"/utf8>>}},
-        fun() ->
-            Outstanding = gleam_stdlib:map_get(
-                erlang:element(5, Piece@1),
-                Begin@1
-            ),
-            case Outstanding of
-                {ok, Block_request} ->
-                    gleam@bool:guard(
-                        Begin@1 /= erlang:element(2, Block_request),
-                        {error,
-                            {peer_error, <<"piece block offset mismatch"/utf8>>}},
-                        fun() ->
-                            Rem = erlang:element(4, erlang:element(2, Piece@1))
-                            - Begin@1,
-                            Expected_block_size = case Rem > 16384 of
-                                true ->
-                                    16384;
-
-                                false ->
-                                    Rem
-                            end,
-                            Rx_block_size = erlang:byte_size(Block@1),
-                            gleam@bool:guard(
-                                Rx_block_size /= Expected_block_size,
-                                {error,
-                                    {peer_error, <<"incomplete block"/utf8>>}},
-                                fun() ->
-                                    Outstanding@1 = gleam@dict:delete(
-                                        erlang:element(5, Piece@1),
-                                        Begin@1
-                                    ),
-                                    New_blocks = gleam@dict:insert(
-                                        erlang:element(3, Piece@1),
-                                        Begin@1,
-                                        Block@1
-                                    ),
-                                    _pipe = {piece_download,
-                                        erlang:element(2, Piece@1),
-                                        New_blocks,
-                                        erlang:element(4, Piece@1),
-                                        Outstanding@1},
-                                    {ok, _pipe}
-                                end
-                            )
-                        end
-                    );
-
-                {error, _} ->
-                    {error, invalid_block}
-            end
-        end
-    ).
-
--file("src/torrent/peer/session.gleam", 202).
--spec request_piece_blocks(peer_session()) -> {ok, peer_session()} |
-    {error, peer_error()}.
-request_piece_blocks(Session) ->
-    Piece@1 = case erlang:element(5, Session) of
-        {some, Piece} -> Piece;
-        _assert_fail ->
-            erlang:error(#{gleam_error => let_assert,
-                        message => <<"Pattern match failed, no pattern matched the value."/utf8>>,
-                        file => <<?FILEPATH/utf8>>,
-                        module => <<"torrent/peer/session"/utf8>>,
-                        function => <<"request_piece_blocks"/utf8>>,
-                        line => 205,
-                        value => _assert_fail,
-                        start => 5608,
-                        'end' => 5646,
-                        pattern_start => 5619,
-                        pattern_end => 5630})
-    end,
-    Take = gleam@int:min(4, 4 - maps:size(erlang:element(5, Piece@1))),
-    Remaining = gleam@list:drop(erlang:element(4, Piece@1), Take),
+request_piece_blocks(Session, Piece) ->
+    Take = gleam@int:min(4, 4 - maps:size(erlang:element(6, Piece))),
+    Remaining = gleam@list:drop(erlang:element(5, Piece), Take),
     Reqs = begin
-        _pipe = erlang:element(4, Piece@1),
+        _pipe = erlang:element(5, Piece),
         gleam@list:take(_pipe, Take)
     end,
     gleam@result:'try'(
@@ -259,7 +142,7 @@ request_piece_blocks(Session) ->
                 Id = 6,
                 Request_message = <<13:4/big-unit:8,
                     Id/integer,
-                    (erlang:element(2, erlang:element(2, Piece@1))):4/big-unit:8,
+                    (erlang:element(2, Piece)):4/big-unit:8,
                     (erlang:element(2, Req)):4/big-unit:8,
                     (erlang:element(3, Req)):4/big-unit:8>>,
                 _pipe@1 = torrent@peer@protocol:send_message(
@@ -275,7 +158,7 @@ request_piece_blocks(Session) ->
         fun(_) ->
             Outstanding@1 = gleam@list:fold(
                 Reqs,
-                erlang:element(5, Piece@1),
+                erlang:element(6, Piece),
                 fun(Outstanding, Req@1) ->
                     gleam@dict:insert(
                         Outstanding,
@@ -284,188 +167,110 @@ request_piece_blocks(Session) ->
                     )
                 end
             ),
-            New_piece = {piece_download,
-                erlang:element(2, Piece@1),
-                erlang:element(3, Piece@1),
+            _pipe@2 = {piece_download,
+                erlang:element(2, Piece),
+                erlang:element(3, Piece),
+                erlang:element(4, Piece),
                 Remaining,
                 Outstanding@1},
-            {ok,
-                {peer_session,
-                    erlang:element(2, Session),
-                    erlang:element(3, Session),
-                    erlang:element(4, Session),
-                    {some, New_piece},
-                    erlang:element(6, Session),
-                    erlang:element(7, Session)}}
+            {ok, _pipe@2}
         end
     ).
 
--file("src/torrent/peer/session.gleam", 142).
--spec peer_listen(peer_session()) -> {ok, piece_result()} |
-    {error, peer_error()}.
-peer_listen(Session) ->
-    gleam@result:'try'(
-        begin
-            _pipe = torrent@peer@protocol:receive_message(
-                erlang:element(2, Session)
-            ),
-            gleam@result:map_error(
-                _pipe,
-                fun(Field@0) -> {protocol_error, Field@0} end
-            )
-        end,
-        fun(Message) -> case Message of
-                choke ->
-                    handle_piece(
-                        {peer_session,
-                            erlang:element(2, Session),
-                            erlang:element(3, Session),
-                            erlang:element(4, Session),
-                            erlang:element(5, Session),
-                            true,
-                            erlang:element(7, Session)}
-                    );
-
-                unchoke ->
-                    handle_piece(
-                        {peer_session,
-                            erlang:element(2, Session),
-                            erlang:element(3, Session),
-                            erlang:element(4, Session),
-                            erlang:element(5, Session),
-                            false,
-                            erlang:element(7, Session)}
-                    );
-
-                have ->
-                    handle_piece(Session);
-
-                {bit_field, _} ->
-                    {error, duplicate_bitfield};
-
-                {piece, _, _, _} ->
-                    gleam@result:'try'(
-                        handle_piece_block(Session, Message),
-                        fun(Piece) ->
-                            case gleam@list:is_empty(erlang:element(4, Piece))
-                            andalso gleam@dict:is_empty(
-                                erlang:element(5, Piece)
-                            ) of
-                                true ->
-                                    gleam@result:'try'(
-                                        handle_piece_complete(Piece),
-                                        fun(Piece@1) ->
-                                            _pipe@1 = {piece_result,
-                                                Session,
-                                                Piece@1},
-                                            {ok, _pipe@1}
-                                        end
-                                    );
-
-                                false ->
-                                    handle_piece(
-                                        {peer_session,
-                                            erlang:element(2, Session),
-                                            erlang:element(3, Session),
-                                            erlang:element(4, Session),
-                                            {some, Piece},
-                                            erlang:element(6, Session),
-                                            erlang:element(7, Session)}
-                                    )
-                            end
-                        end
-                    );
-
-                Message@1 ->
-                    {error,
-                        {unexpected_message,
-                            torrent@peer@protocol:message_id(Message@1)}}
-            end end
-    ).
-
--file("src/torrent/peer/session.gleam", 130).
--spec handle_piece(peer_session()) -> {ok, piece_result()} |
-    {error, peer_error()}.
-handle_piece(Session) ->
-    case Session of
-        {peer_session, _, _, _, none, _, _} ->
-            erlang:error(#{gleam_error => panic,
-                    message => <<"piece not set before start"/utf8>>,
-                    file => <<?FILEPATH/utf8>>,
-                    module => <<"torrent/peer/session"/utf8>>,
-                    function => <<"handle_piece"/utf8>>,
-                    line => 132});
-
-        {peer_session, _, _, _, _, false, true} ->
-            gleam@result:'try'(
-                request_piece_blocks(Session),
-                fun(Session@1) -> peer_listen(Session@1) end
-            );
-
-        {peer_session, _, _, _, _, _, false} ->
-            peer_listen(Session);
-
-        {peer_session, _, _, _, _, true, true} ->
-            peer_listen(Session)
-    end.
-
--file("src/torrent/peer/session.gleam", 80).
--spec handle_piece_download(
+-file("src/torrent/peer/session.gleam", 207).
+-spec ask_lease(
     gleam@erlang@process:subject(torrent@messages:peer_event()),
     peer_session()
 ) -> nil.
-handle_piece_download(Parent_subject, Session) ->
-    Piece@1 = case erlang:element(5, Session) of
-        {some, Piece} -> Piece;
+ask_lease(Parent_subject, Session) ->
+    Bitfield@1 = case erlang:element(4, Session) of
+        {some, Bitfield} -> Bitfield;
         _assert_fail ->
             erlang:error(#{gleam_error => let_assert,
-                        message => <<"Pattern match failed, no pattern matched the value."/utf8>>,
+                        message => <<"idle state before bitfield is set"/utf8>>,
                         file => <<?FILEPATH/utf8>>,
                         module => <<"torrent/peer/session"/utf8>>,
-                        function => <<"handle_piece_download"/utf8>>,
-                        line => 84,
+                        function => <<"ask_lease"/utf8>>,
+                        line => 211,
                         value => _assert_fail,
-                        start => 1924,
-                        'end' => 1962,
-                        pattern_start => 1935,
-                        pattern_end => 1946})
+                        start => 5295,
+                        'end' => 5339,
+                        pattern_start => 5306,
+                        pattern_end => 5320})
     end,
-    Result = handle_piece(Session),
-    case Result of
-        {ok, {piece_result, Session@1, Data}} ->
-            gleam@erlang@process:send(
-                Parent_subject,
-                {piece_completed,
-                    erlang:element(2, erlang:element(2, Piece@1)),
-                    Data}
-            ),
-            Next_piece = gleam@erlang@process:call_forever(
-                Parent_subject,
-                fun(Subject) ->
-                    {lease_piece, erlang:element(3, Session@1), Subject}
-                end
-            ),
-            Piece_dwnld = new_piece_download(Next_piece),
-            New_session = {peer_session,
-                erlang:element(2, Session@1),
-                erlang:element(3, Session@1),
-                erlang:element(4, Session@1),
-                {some, Piece_dwnld},
-                erlang:element(6, Session@1),
-                erlang:element(7, Session@1)},
-            handle_piece_download(Parent_subject, New_session);
+    gleam@erlang@process:send(
+        Parent_subject,
+        {lease_piece, erlang:element(3, Session), Bitfield@1}
+    ).
 
-        {error, Err} ->
-            gleam@erlang@process:send(
+-file("src/torrent/peer/session.gleam", 238).
+-spec handle_piece_complete(
+    gleam@erlang@process:subject(torrent@messages:peer_event()),
+    torrent@peer@protocol:peer_id(),
+    piece_download()
+) -> nil.
+handle_piece_complete(Parent_subject, Peer_id, Piece) ->
+    Blocks = begin
+        _pipe = maps:to_list(erlang:element(4, Piece)),
+        _pipe@1 = gleam@list:sort(
+            _pipe,
+            fun(A, B) ->
+                gleam@int:compare(erlang:element(1, A), erlang:element(1, B))
+            end
+        ),
+        gleam@list:map(_pipe@1, fun gleam@pair:second/1)
+    end,
+    Bin = gleam_stdlib:bit_array_concat(Blocks),
+    Message = {piece_completed, Peer_id, erlang:element(2, Piece), Bin},
+    gleam@erlang@process:send(Parent_subject, Message).
+
+-file("src/torrent/peer/session.gleam", 216).
+-spec notify_or_progress(
+    gleam@erlang@process:subject(torrent@messages:peer_event()),
+    peer_session(),
+    piece_download()
+) -> {ok, peer_session()} | {error, peer_error()}.
+notify_or_progress(Parent_subject, Session, Piece) ->
+    case {gleam@list:is_empty(erlang:element(5, Piece)),
+        gleam@dict:is_empty(erlang:element(6, Piece))} of
+        {true, true} ->
+            handle_piece_complete(
                 Parent_subject,
-                {peer_disconnected,
-                    erlang:element(3, Session),
-                    describe_error(Err)}
+                erlang:element(3, Session),
+                Piece
             ),
-            gleam@erlang@process:kill(erlang:self())
+            ask_lease(Parent_subject, Session),
+            _pipe = {peer_session,
+                erlang:element(2, Session),
+                erlang:element(3, Session),
+                erlang:element(4, Session),
+                erlang:element(5, Session),
+                no_piece,
+                erlang:element(7, Session),
+                erlang:element(8, Session)},
+            {ok, _pipe};
+
+        {true, false} ->
+            {ok, Session};
+
+        {false, _} ->
+            gleam@result:'try'(
+                request_piece_blocks(Session, Piece),
+                fun(Piece@1) ->
+                    _pipe@1 = {peer_session,
+                        erlang:element(2, Session),
+                        erlang:element(3, Session),
+                        erlang:element(4, Session),
+                        erlang:element(5, Session),
+                        {download, Piece@1},
+                        erlang:element(7, Session),
+                        erlang:element(8, Session)},
+                    {ok, _pipe@1}
+                end
+            )
     end.
 
--file("src/torrent/peer/session.gleam", 290).
+-file("src/torrent/peer/session.gleam", 397).
 -spec is_any_bit_set(bitstring()) -> boolean().
 is_any_bit_set(Bitfield) ->
     case Bitfield of
@@ -479,11 +284,26 @@ is_any_bit_set(Bitfield) ->
             false
     end.
 
--file("src/torrent/peer/session.gleam", 184).
--spec handle_bitfield(peer_session(), bitstring()) -> {ok, peer_session()} |
+-file("src/torrent/peer/session.gleam", 302).
+-spec send_interested(peer_session()) -> {ok, peer_session()} |
     {error, peer_error()}.
-handle_bitfield(Session, Bitfield) ->
-    case is_any_bit_set(Bitfield) of
+send_interested(Session) ->
+    Bitfield@1 = case erlang:element(4, Session) of
+        {some, Bitfield} -> Bitfield;
+        _assert_fail ->
+            erlang:error(#{gleam_error => let_assert,
+                        message => <<"Bitfield not set"/utf8>>,
+                        file => <<?FILEPATH/utf8>>,
+                        module => <<"torrent/peer/session"/utf8>>,
+                        function => <<"send_interested"/utf8>>,
+                        line => 303,
+                        value => _assert_fail,
+                        start => 7971,
+                        'end' => 8015,
+                        pattern_start => 7982,
+                        pattern_end => 7996})
+    end,
+    case is_any_bit_set(Bitfield@1) of
         true ->
             Id = torrent@peer@protocol:message_id(interested),
             Message = <<1:4/big-unit:8, Id/integer>>,
@@ -506,15 +326,439 @@ handle_bitfield(Session, Bitfield) ->
                             erlang:element(4, Session),
                             erlang:element(5, Session),
                             erlang:element(6, Session),
+                            erlang:element(7, Session),
                             true}}
                 end
             );
 
         false ->
-            {error, {peer_error, <<"they have nothing"/utf8>>}}
+            {error, {peer_error, <<"peer has nothing"/utf8>>}}
     end.
 
--file("src/torrent/peer/session.gleam", 110).
+-file("src/torrent/peer/session.gleam", 183).
+-spec act(
+    gleam@erlang@process:subject(torrent@messages:peer_event()),
+    peer_session()
+) -> {ok, peer_session()} | {error, peer_error()}.
+act(Parent_subject, Session) ->
+    case Session of
+        {peer_session, _, _, none, _, _, _, _} ->
+            {ok, Session};
+
+        {peer_session, _, _, _, _, _, _, false} ->
+            send_interested(Session);
+
+        {peer_session, _, _, _, _, _, true, _} ->
+            {ok, Session};
+
+        {peer_session, _, _, _, _, no_piece, _, _} ->
+            ask_lease(Parent_subject, Session),
+            _pipe = {peer_session,
+                erlang:element(2, Session),
+                erlang:element(3, Session),
+                erlang:element(4, Session),
+                erlang:element(5, Session),
+                await_lease,
+                erlang:element(7, Session),
+                erlang:element(8, Session)},
+            {ok, _pipe};
+
+        {peer_session, _, _, _, _, await_lease, _, _} ->
+            {ok, Session};
+
+        {peer_session, _, _, _, _, {download, Piece}, _, _} ->
+            notify_or_progress(Parent_subject, Session, Piece)
+    end.
+
+-file("src/torrent/peer/session.gleam", 359).
+-spec handle_piece_block(torrent@peer@protocol:peer_message(), piece_download()) -> {ok,
+        piece_download()} |
+    {error, peer_error()}.
+handle_piece_block(Message, Piece) ->
+    {Peer_piece_index@1, Begin@1, Block@1} = case Message of
+        {piece, Peer_piece_index, Begin, Block} -> {
+        Peer_piece_index,
+            Begin,
+            Block};
+        _assert_fail ->
+            erlang:error(#{gleam_error => let_assert,
+                        message => <<"Pattern match failed, no pattern matched the value."/utf8>>,
+                        file => <<?FILEPATH/utf8>>,
+                        module => <<"torrent/peer/session"/utf8>>,
+                        function => <<"handle_piece_block"/utf8>>,
+                        line => 363,
+                        value => _assert_fail,
+                        start => 9551,
+                        'end' => 9609,
+                        pattern_start => 9562,
+                        pattern_end => 9599})
+    end,
+    gleam@bool:guard(
+        Peer_piece_index@1 /= erlang:element(2, Piece),
+        {error, {peer_error, <<"piece index mismatch"/utf8>>}},
+        fun() ->
+            Outstanding = gleam_stdlib:map_get(
+                erlang:element(6, Piece),
+                Begin@1
+            ),
+            case Outstanding of
+                {ok, _} ->
+                    Rem = erlang:element(3, Piece) - Begin@1,
+                    Expected_block_size = case Rem > 16384 of
+                        true ->
+                            16384;
+
+                        false ->
+                            Rem
+                    end,
+                    Rx_block_size = erlang:byte_size(Block@1),
+                    gleam@bool:guard(
+                        Rx_block_size /= Expected_block_size,
+                        {error, {peer_error, <<"incomplete block"/utf8>>}},
+                        fun() ->
+                            Outstanding@1 = gleam@dict:delete(
+                                erlang:element(6, Piece),
+                                Begin@1
+                            ),
+                            New_blocks = gleam@dict:insert(
+                                erlang:element(4, Piece),
+                                Begin@1,
+                                Block@1
+                            ),
+                            _pipe = {piece_download,
+                                erlang:element(2, Piece),
+                                erlang:element(3, Piece),
+                                New_blocks,
+                                erlang:element(5, Piece),
+                                Outstanding@1},
+                            {ok, _pipe}
+                        end
+                    );
+
+                {error, _} ->
+                    {ok, Piece}
+            end
+        end
+    ).
+
+-file("src/torrent/peer/session.gleam", 293).
+-spec handle_extension_message(
+    peer_session(),
+    torrent@peer@protocol:extension_message()
+) -> peer_session().
+handle_extension_message(Session, Message) ->
+    case Message of
+        {handshake, Extensions} ->
+            Extensions@1 = maps:from_list(Extensions),
+            {peer_session,
+                erlang:element(2, Session),
+                erlang:element(3, Session),
+                erlang:element(4, Session),
+                {some, Extensions@1},
+                erlang:element(6, Session),
+                erlang:element(7, Session),
+                erlang:element(8, Session)}
+    end.
+
+-file("src/torrent/peer/session.gleam", 261).
+-spec handle_message(peer_session(), torrent@peer@protocol:peer_message()) -> {ok,
+        peer_session()} |
+    {error, peer_error()}.
+handle_message(Session, Message) ->
+    case Message of
+        choke ->
+            _pipe = {peer_session,
+                erlang:element(2, Session),
+                erlang:element(3, Session),
+                erlang:element(4, Session),
+                erlang:element(5, Session),
+                erlang:element(6, Session),
+                true,
+                erlang:element(8, Session)},
+            {ok, _pipe};
+
+        unchoke ->
+            _pipe@1 = {peer_session,
+                erlang:element(2, Session),
+                erlang:element(3, Session),
+                erlang:element(4, Session),
+                erlang:element(5, Session),
+                erlang:element(6, Session),
+                false,
+                erlang:element(8, Session)},
+            {ok, _pipe@1};
+
+        have ->
+            {ok, Session};
+
+        {bit_field, Bitfield} ->
+            case erlang:element(4, Session) of
+                {some, _} ->
+                    {error, duplicate_bitfield};
+
+                none ->
+                    _pipe@2 = {peer_session,
+                        erlang:element(2, Session),
+                        erlang:element(3, Session),
+                        {some, Bitfield},
+                        erlang:element(5, Session),
+                        erlang:element(6, Session),
+                        erlang:element(7, Session),
+                        erlang:element(8, Session)},
+                    {ok, _pipe@2}
+            end;
+
+        {extension, Message@1} ->
+            _pipe@3 = handle_extension_message(Session, Message@1),
+            {ok, _pipe@3};
+
+        {piece, _, _, _} ->
+            case erlang:element(6, Session) of
+                {download, Piece} ->
+                    gleam@result:'try'(
+                        handle_piece_block(Message, Piece),
+                        fun(Piece@1) ->
+                            _pipe@4 = {peer_session,
+                                erlang:element(2, Session),
+                                erlang:element(3, Session),
+                                erlang:element(4, Session),
+                                erlang:element(5, Session),
+                                {download, Piece@1},
+                                erlang:element(7, Session),
+                                erlang:element(8, Session)},
+                            {ok, _pipe@4}
+                        end
+                    );
+
+                _ ->
+                    {error,
+                        {unexpected_message,
+                            torrent@peer@protocol:message_id(Message)}}
+            end;
+
+        _ ->
+            {error,
+                {unexpected_message, torrent@peer@protocol:message_id(Message)}}
+    end.
+
+-file("src/torrent/peer/session.gleam", 123).
+-spec run(
+    gleam@erlang@process:subject(torrent@messages:peer_event()),
+    gleam@erlang@process:subject(reader_message()),
+    peer_session()
+) -> peer_error().
+run(Parent_subject, Message_subject, Session) ->
+    Piece_subject = gleam@erlang@process:new_subject(),
+    Selector = begin
+        _pipe = gleam_erlang_ffi:new_selector(),
+        _pipe@1 = gleam@erlang@process:select_map(
+            _pipe,
+            Piece_subject,
+            fun(Field@0) -> {piece_lease, Field@0} end
+        ),
+        gleam@erlang@process:select_map(
+            _pipe@1,
+            Message_subject,
+            fun(Field@0) -> {reader_message, Field@0} end
+        )
+    end,
+    case gleam_erlang_ffi:select(Selector, 10000) of
+        {ok, Event} ->
+            case Event of
+                {piece_lease, Info} ->
+                    Piece = new_piece_download(Info),
+                    New_session = {peer_session,
+                        erlang:element(2, Session),
+                        erlang:element(3, Session),
+                        erlang:element(4, Session),
+                        erlang:element(5, Session),
+                        {download, Piece},
+                        erlang:element(7, Session),
+                        erlang:element(8, Session)},
+                    run(Parent_subject, Message_subject, New_session);
+
+                {reader_message, {message, Message}} ->
+                    Result = begin
+                        gleam@result:'try'(
+                            handle_message(Session, Message),
+                            fun(Session@1) ->
+                                _ = case Message of
+                                    {bit_field, _} ->
+                                        gleam@erlang@process:send(
+                                            Parent_subject,
+                                            {ready,
+                                                erlang:element(3, Session@1),
+                                                Piece_subject}
+                                        );
+
+                                    _ ->
+                                        nil
+                                end,
+                                act(Parent_subject, Session@1)
+                            end
+                        )
+                    end,
+                    case Result of
+                        {ok, Session@2} ->
+                            run(Parent_subject, Message_subject, Session@2);
+
+                        {error, Err} ->
+                            Err
+                    end;
+
+                {reader_message, {read_error, Err@1}} ->
+                    Err@1
+            end;
+
+        {error, _} ->
+            {peer_error, <<"taking too long"/utf8>>}
+    end.
+
+-file("src/torrent/peer/session.gleam", 107).
+-spec peer_reader(gleam@erlang@process:subject(reader_message()), mug:socket()) -> nil.
+peer_reader(Message_subject, Socket) ->
+    Result = begin
+        _pipe = torrent@peer@protocol:receive_message(Socket),
+        gleam@result:map_error(
+            _pipe,
+            fun(Field@0) -> {protocol_error, Field@0} end
+        )
+    end,
+    case Result of
+        {ok, Message} ->
+            gleam@erlang@process:send(Message_subject, {message, Message}),
+            peer_reader(Message_subject, Socket);
+
+        {error, Err} ->
+            gleam@erlang@process:send(Message_subject, {read_error, Err})
+    end.
+
+-file("src/torrent/peer/session.gleam", 79).
+-spec start_session(
+    gleam@erlang@process:subject(torrent@messages:peer_event()),
+    torrent@peer@protocol:endpoint(),
+    bitstring(),
+    torrent@peer@protocol:peer_id()
+) -> {ok, nil} | {error, peer_error()}.
+start_session(Parent_subject, Endpoint, Info_hash, Peer_id) ->
+    gleam@result:'try'(
+        begin
+            _pipe = torrent@peer@protocol:handshake(
+                Endpoint,
+                Info_hash,
+                Peer_id
+            ),
+            gleam@result:map_error(
+                _pipe,
+                fun(Field@0) -> {protocol_error, Field@0} end
+            )
+        end,
+        fun(_use0) ->
+            {Socket, Peer_peer_id, Extension_supported} = _use0,
+            Session = new_session(Socket, Peer_peer_id),
+            gleam@result:'try'(
+                extended_handshake(
+                    erlang:element(2, Session),
+                    Extension_supported
+                ),
+                fun(_) ->
+                    Message_subject = gleam@erlang@process:new_subject(),
+                    proc_lib:spawn_link(
+                        fun() ->
+                            peer_reader(
+                                Message_subject,
+                                erlang:element(2, Session)
+                            )
+                        end
+                    ),
+                    Err = run(Parent_subject, Message_subject, Session),
+                    disconnect(Parent_subject, Peer_peer_id, Err),
+                    {ok, nil}
+                end
+            )
+        end
+    ).
+
+-file("src/torrent/peer/session.gleam", 448).
+-spec receive_all_blocks(peer_session(), piece_download()) -> {ok,
+        piece_download()} |
+    {error, peer_error()}.
+receive_all_blocks(Session, Piece) ->
+    case {gleam@list:is_empty(erlang:element(5, Piece)),
+        gleam@dict:is_empty(erlang:element(6, Piece))} of
+        {true, true} ->
+            {ok, Piece};
+
+        {_, _} ->
+            gleam@result:'try'(
+                begin
+                    _pipe = torrent@peer@protocol:receive_message(
+                        erlang:element(2, Session)
+                    ),
+                    gleam@result:map_error(
+                        _pipe,
+                        fun(Field@0) -> {protocol_error, Field@0} end
+                    )
+                end,
+                fun(Message) -> case Message of
+                        {piece, _, _, _} ->
+                            gleam@result:'try'(
+                                handle_piece_block(Message, Piece),
+                                fun(Piece@1) ->
+                                    receive_all_blocks(Session, Piece@1)
+                                end
+                            );
+
+                        _ ->
+                            receive_all_blocks(Session, Piece)
+                    end end
+            )
+    end.
+
+-file("src/torrent/peer/session.gleam", 472).
+-spec receive_until(
+    mug:socket(),
+    fun((torrent@peer@protocol:peer_message()) -> {ok, BBG} | {error, nil})
+) -> {ok, BBG} | {error, peer_error()}.
+receive_until(Socket, Done) ->
+    gleam@result:'try'(
+        begin
+            _pipe = torrent@peer@protocol:receive_message(Socket),
+            gleam@result:map_error(
+                _pipe,
+                fun(Field@0) -> {protocol_error, Field@0} end
+            )
+        end,
+        fun(Message) -> case Done(Message) of
+                {ok, Result} ->
+                    {ok, Result};
+
+                {error, _} ->
+                    receive_until(Socket, Done)
+            end end
+    ).
+
+-file("src/torrent/peer/session.gleam", 439).
+-spec wait_unchoke(peer_session()) -> {ok, peer_session()} |
+    {error, peer_error()}.
+wait_unchoke(Session) ->
+    receive_until(erlang:element(2, Session), fun(Message) -> case Message of
+                unchoke ->
+                    _pipe = {peer_session,
+                        erlang:element(2, Session),
+                        erlang:element(3, Session),
+                        erlang:element(4, Session),
+                        erlang:element(5, Session),
+                        erlang:element(6, Session),
+                        false,
+                        erlang:element(8, Session)},
+                    {ok, _pipe};
+
+                _ ->
+                    {error, nil}
+            end end).
+
+-file("src/torrent/peer/session.gleam", 426).
 -spec receive_bitfield(peer_session()) -> {ok, peer_session()} |
     {error, peer_error()}.
 receive_bitfield(Session) ->
@@ -530,57 +774,22 @@ receive_bitfield(Session) ->
         end,
         fun(Message) -> case Message of
                 {bit_field, Bits} ->
-                    handle_bitfield(
-                        {peer_session,
-                            erlang:element(2, Session),
-                            erlang:element(3, Session),
-                            Bits,
-                            erlang:element(5, Session),
-                            erlang:element(6, Session),
-                            erlang:element(7, Session)},
-                        Bits
-                    );
+                    _pipe@1 = {peer_session,
+                        erlang:element(2, Session),
+                        erlang:element(3, Session),
+                        {some, Bits},
+                        erlang:element(5, Session),
+                        erlang:element(6, Session),
+                        erlang:element(7, Session),
+                        erlang:element(8, Session)},
+                    {ok, _pipe@1};
 
                 _ ->
                     {error, {peer_error, <<"no bitfield"/utf8>>}}
             end end
     ).
 
--file("src/torrent/peer/session.gleam", 58).
--spec start_session(
-    gleam@erlang@process:subject(torrent@messages:peer_event()),
-    mug:socket(),
-    torrent@peer@protocol:peer_id()
-) -> {ok, nil} | {error, peer_error()}.
-start_session(Parent_subject, Socket, Peer_id) ->
-    Session = new_session(Socket, Peer_id),
-    gleam@result:'try'(
-        receive_bitfield(Session),
-        fun(Session@1) ->
-            Piece = gleam@erlang@process:call(
-                Parent_subject,
-                1000,
-                fun(Subject) ->
-                    {ready,
-                        erlang:element(3, Session@1),
-                        erlang:element(4, Session@1),
-                        Subject}
-                end
-            ),
-            Piece_dwnld = new_piece_download(Piece),
-            New_session = {peer_session,
-                erlang:element(2, Session@1),
-                erlang:element(3, Session@1),
-                erlang:element(4, Session@1),
-                {some, Piece_dwnld},
-                erlang:element(6, Session@1),
-                erlang:element(7, Session@1)},
-            handle_piece_download(Parent_subject, New_session),
-            {ok, nil}
-        end
-    ).
-
--file("src/torrent/peer/session.gleam", 319).
+-file("src/torrent/peer/session.gleam", 404).
 -spec download_piece(
     mug:socket(),
     torrent@peer@protocol:peer_id(),
@@ -591,18 +800,48 @@ download_piece(Socket, Peer_id, Piece) ->
     gleam@result:'try'(
         receive_bitfield(Session),
         fun(Session@1) ->
-            Piece@1 = new_piece_download(Piece),
-            Session@2 = {peer_session,
-                erlang:element(2, Session@1),
-                erlang:element(3, Session@1),
-                erlang:element(4, Session@1),
-                {some, Piece@1},
-                erlang:element(6, Session@1),
-                erlang:element(7, Session@1)},
             gleam@result:'try'(
-                handle_piece(Session@2),
-                fun(Result) -> _pipe = erlang:element(3, Result),
-                    {ok, _pipe} end
+                send_interested(Session@1),
+                fun(Session@2) ->
+                    gleam@result:'try'(
+                        wait_unchoke(Session@2),
+                        fun(Session@3) ->
+                            Piece@1 = new_piece_download(Piece),
+                            gleam@result:'try'(
+                                request_piece_blocks(Session@3, Piece@1),
+                                fun(Piece@2) ->
+                                    gleam@result:'try'(
+                                        receive_all_blocks(Session@3, Piece@2),
+                                        fun(Piece@3) ->
+                                            Blocks = begin
+                                                _pipe = maps:to_list(
+                                                    erlang:element(4, Piece@3)
+                                                ),
+                                                _pipe@1 = gleam@list:sort(
+                                                    _pipe,
+                                                    fun(A, B) ->
+                                                        gleam@int:compare(
+                                                            erlang:element(1, A),
+                                                            erlang:element(1, B)
+                                                        )
+                                                    end
+                                                ),
+                                                gleam@list:map(
+                                                    _pipe@1,
+                                                    fun gleam@pair:second/1
+                                                )
+                                            end,
+                                            _pipe@2 = gleam_stdlib:bit_array_concat(
+                                                Blocks
+                                            ),
+                                            {ok, _pipe@2}
+                                        end
+                                    )
+                                end
+                            )
+                        end
+                    )
+                end
             )
         end
     ).

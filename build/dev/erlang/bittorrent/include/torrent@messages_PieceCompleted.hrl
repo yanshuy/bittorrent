@@ -1,1 +1,5 @@
--record(piece_completed, {index :: integer(), data :: bitstring()}).
+-record(piece_completed, {
+    peer :: torrent@peer@protocol:peer_id(),
+    index :: integer(),
+    piece :: bitstring()
+}).
