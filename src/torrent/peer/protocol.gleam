@@ -1,10 +1,9 @@
 import bencode
+import gleam/bit_array
 import gleam/int
 import gleam/list
 import gleam/result.{map_error, replace_error, try}
 import mug.{ConnectionOptions}
-
-// import torrent/peer/extension
 
 pub type PeerMessage {
   Choke
@@ -21,6 +20,7 @@ pub type PeerMessage {
 pub type ExtensionMessage {
   Handshake(extensions: List(#(String, Int)))
   MetadataRequest(piece_index: Int)
+  MetadataPiece(piece_index: Int, piece: BitArray)
 }
 
 pub type PeerId {
@@ -54,10 +54,12 @@ pub fn handshake(endpoint: Endpoint, info_hash: BitArray, peer_id: PeerId) {
   use #(peer_peer_id, reserved) <- try(peer_handshake(socket, info_hash, id))
 
   case reserved {
-    <<_:size(64 - 20), 1:size(1), _:bits>> -> #(socket, peer_peer_id, True)
-    _ -> #(socket, peer_peer_id, False)
+    <<_:size(43), 1:size(1), _:bits>> -> {
+      use _ <- try(extension_handshake(socket))
+      #(socket, peer_peer_id) |> Ok
+    }
+    _ -> #(socket, peer_peer_id) |> Ok
   }
-  |> Ok
 }
 
 fn peer_handshake(
@@ -90,6 +92,29 @@ fn peer_handshake(
     }
     _ -> Error(InvalidMessage)
   }
+}
+
+pub fn extension_handshake(socket: mug.Socket) -> Result(Nil, ProtocolError) {
+  let extensions =
+    [#("ut_metadata", bencode.Int(10))]
+    |> bencode.Dict
+
+  let encoded =
+    [
+      #("m", extensions),
+    ]
+    |> bencode.Dict
+    |> bencode.to_bencode
+    |> bencode.encode
+
+  let message_len = 1 + 1 + bit_array.byte_size(encoded)
+  let extension_message = <<
+    message_len:big-size(32),
+    20:int,
+    0:int,
+    encoded:bits,
+  >>
+  send_message(socket, extension_message)
 }
 
 pub fn log(m: PeerMessage) {
@@ -169,26 +194,44 @@ pub fn parse_extension_message(
   case extension_id {
     0 -> {
       use bencode <- try(bencode.decode(payload) |> map_error(BencodeError))
-
       use dict <- try(
         bencode.dict(bencode)
-        |> replace_error(ProtocolErrorMsg(
-          "invalid extension handshake response",
-        )),
+        |> replace_error(InvalidMessage),
       )
       use entries <- try(
         bencode.get_entries(dict, "m")
-        |> replace_error(ProtocolErrorMsg("missing 'm' key in handshake")),
+        |> replace_error(InvalidMessage),
       )
       use extensions <- try(
         list.try_map(entries, fn(entry) {
           case entry {
             #(key, bencode.BInteger(int)) -> Ok(#(key, int))
-            _ -> Error(ProtocolErrorMsg("invalid type inside 'm' dictionary"))
+            _ -> Error(InvalidMessage)
           }
         }),
       )
       Extension(Handshake(extensions)) |> Ok
+    }
+
+    10 -> {
+      use #(bencode, piece) <- try(
+        bencode.decode_loop(payload) |> map_error(BencodeError),
+      )
+      use entries <- try(case bencode {
+        bencode.BDict(entries) ->
+          list.try_map(entries, fn(entry) {
+            case entry {
+              #(key, bencode.BInteger(int)) -> #(key, int) |> Ok
+              _ -> Error(InvalidMessage)
+            }
+          })
+        _ -> Error(InvalidMessage)
+      })
+
+      use piece_index <- try(
+        entries |> list.key_find("piece") |> replace_error(InvalidMessage),
+      )
+      Extension(MetadataPiece(piece_index, piece)) |> Ok
     }
     _ -> Error(UnknownMessageId(extension_id))
   }

@@ -3,16 +3,15 @@ import bencode
 import gleam/bit_array
 import gleam/bool
 import gleam/crypto
+import gleam/dict
 import gleam/int
 import gleam/io
 import gleam/json
 import gleam/list
 import gleam/result.{map_error, replace_error, try}
 import gleam/string
-import mug
 import simplifile
 import torrent/download
-import torrent/peer/extension
 import torrent/peer/protocol
 import torrent/peer/session
 import torrent/torrent
@@ -93,6 +92,20 @@ pub fn execute_cmd(args: List(String)) -> Result(Nil, CmdError) {
         _ -> Error(InsufficientArguments("magnet_info"))
       }
 
+    ["magnet_download_piece", ..rest] ->
+      case rest {
+        ["-o", download_path, magnet_link, piece_index_str] ->
+          cmd_magnet_download_piece(download_path, magnet_link, piece_index_str)
+        _ -> Error(InsufficientArguments("magnet_download_piece"))
+      }
+
+    ["magnet_download", ..rest] ->
+      case rest {
+        ["-o", download_path, magnet_link] ->
+          cmd_magnet_download(download_path, magnet_link)
+        _ -> Error(InsufficientArguments("magnet_download_piece"))
+      }
+
     [command, ..] -> Error(UnknownCommand(command))
   }
 }
@@ -108,7 +121,7 @@ fn cmd_decode(encode_str: String) -> Result(Nil, CmdError) {
   Ok(Nil)
 }
 
-fn info(filename: String) -> Result(torrent.TorrentInfo, CmdError) {
+fn info(filename: String) -> Result(#(String, torrent.TorrentInfo), CmdError) {
   use bits <- try(simplifile.read_bits(filename) |> map_error(FileError))
   use data <- try(bencode.decode(bits) |> map_error(DecodeError))
 
@@ -116,9 +129,9 @@ fn info(filename: String) -> Result(torrent.TorrentInfo, CmdError) {
 }
 
 fn cmd_info(filename: String) -> Result(Nil, CmdError) {
-  use torrent <- try(info(filename))
+  use #(tracker_url, torrent) <- try(info(filename))
 
-  io.println("Tracker URL: " <> torrent.announce)
+  io.println("Tracker URL: " <> tracker_url)
   io.println("Length: " <> int.to_string(torrent.length))
 
   let encoded =
@@ -141,14 +154,9 @@ fn cmd_info(filename: String) -> Result(Nil, CmdError) {
 fn cmd_peers(filename: String) -> Result(Nil, CmdError) {
   use peer_id <- try(load_peer_id() |> map_error(FileError))
 
-  use torrent <- try(info(filename))
+  use #(tracker_url, torrent) <- try(info(filename))
   use peers <- try(
-    tracker.get_peers(
-      torrent.announce,
-      torrent.info_hash,
-      torrent.length,
-      peer_id,
-    )
+    tracker.get_peers(tracker_url, torrent.info_hash, torrent.length, peer_id)
     |> map_error(TrackerError),
   )
   io.println(string.join(peers, with: "\n"))
@@ -167,10 +175,10 @@ fn new_endpoint(endpoint: String) -> Result(protocol.Endpoint, Nil) {
 
 fn cmd_handshake(filename: String, endpoint: String) -> Result(Nil, CmdError) {
   use peer_id <- try(load_peer_id() |> map_error(FileError))
-  use torrent <- try(info(filename))
+  use #(_, torrent) <- try(info(filename))
 
   use endpoint <- try(new_endpoint(endpoint) |> replace_error(InvalidEndpoint))
-  use #(_socket, peer_peer_id, _) <- try(
+  use #(_socket, peer_peer_id) <- try(
     protocol.handshake(endpoint, torrent.info_hash, peer_id)
     |> map_error(ProtocolError),
   )
@@ -187,26 +195,18 @@ fn cmd_download_piece(
     int.parse(piece_index_str) |> replace_error(InvalidArguments),
   )
   use peer_id <- try(load_peer_id() |> map_error(FileError))
-  use torrent <- try(info(torrent_file))
+  use #(tracker_url, torrent) <- try(info(torrent_file))
 
   use peers <- try(
-    tracker.get_peers(
-      torrent.announce,
-      torrent.info_hash,
-      torrent.length,
-      peer_id,
-    )
+    tracker.get_peers(tracker_url, torrent.info_hash, torrent.length, peer_id)
     |> map_error(TrackerError),
   )
-
-  use endpoint <- try(
-    peers
-    |> list.first
-    |> replace_error(InvalidArguments),
+  use first <- try(
+    list.first(peers)
+    |> replace_error(CmdError("No peers")),
   )
-
   use endpoint <- try(
-    new_endpoint(endpoint)
+    new_endpoint(first)
     |> replace_error(InvalidEndpoint),
   )
 
@@ -216,7 +216,15 @@ fn cmd_download_piece(
     |> list.first
     |> replace_error(InvalidPieceIndex(piece_index)),
   )
-  download.download_piece(download_path, endpoint, torrent, peer_id, piece)
+  let piece = torrent.Piece(piece)
+
+  use #(socket, peer_peer_id) <- try(
+    protocol.handshake(endpoint, torrent.info_hash, peer_id)
+    |> result.map_error(ProtocolError),
+  )
+  let session = session.new_session(socket, peer_peer_id, session.NoPiece)
+
+  download.download_piece(download_path, piece, session)
   |> map_error(TorrentError)
 }
 
@@ -225,24 +233,19 @@ fn cmd_download(
   torrent_file: String,
 ) -> Result(Nil, CmdError) {
   use peer_id <- try(load_peer_id() |> map_error(FileError))
-  use torrent <- try(info(torrent_file))
+  use #(tracker_url, torrent) <- try(info(torrent_file))
 
-  use peer_endpoints <- try(
-    tracker.get_peers(
-      torrent.announce,
-      torrent.info_hash,
-      torrent.length,
-      peer_id,
-    )
+  use peers <- try(
+    tracker.get_peers(tracker_url, torrent.info_hash, torrent.length, peer_id)
     |> map_error(TrackerError),
   )
   use endpoints <- try(
-    peer_endpoints
-    |> list.try_map(fn(endpoint) {
+    list.try_map(peers, fn(endpoint) {
       new_endpoint(endpoint) |> replace_error(InvalidEndpoint)
     }),
   )
 
+  let torrent = download.Torrent(torrent)
   use _ <- try(
     download.download_torrent(download_path, endpoints, torrent, peer_id)
     |> map_error(TorrentError),
@@ -252,62 +255,43 @@ fn cmd_download(
 }
 
 fn cmd_parse_magnet(magnet_link: String) -> Result(Nil, CmdError) {
-  use magnet_info <- try(
+  use #(tracker_url, info_hash) <- try(
     torrent.parse_magnet(magnet_link) |> replace_error(InvalidMagnetLink),
   )
-  io.println("Tracker URL: " <> magnet_info.announce)
+  io.println("Tracker URL: " <> tracker_url)
   io.println(
     "Info Hash: "
-    <> magnet_info.info_hash
+    <> info_hash
     |> bit_array.base16_encode
     |> string.lowercase,
   )
   Ok(Nil)
 }
 
-fn extension_handshake(socket: mug.Socket, peer_id: protocol.PeerId) {
-  let session = session.new_session(socket, peer_id)
-  use session <- try(session.receive_bitfield(session) |> map_error(PeerError))
-  use _ <- try(
-    extension.send_handshake(session.socket)
-    |> map_error(ProtocolError),
-  )
-
-  session.receive_until(session.socket, fn(message) {
-    case message {
-      protocol.Extension(protocol.Handshake(extensions)) -> {
-        Ok(extensions)
-      }
-      _ -> Error(Nil)
-    }
-  })
-  |> map_error(PeerError)
-}
-
 fn cmd_magnet_handshake(magnet_link: String) -> Result(Nil, CmdError) {
   use peer_id <- try(load_peer_id() |> map_error(FileError))
-  use magnet_info <- try(
+  use #(tracker_url, info_hash) <- try(
     torrent.parse_magnet(magnet_link) |> replace_error(InvalidMagnetLink),
   )
   use peers <- try(
-    tracker.get_peers(magnet_info.announce, magnet_info.info_hash, 10, peer_id)
+    tracker.get_peers(tracker_url, info_hash, 10, peer_id)
     |> map_error(TrackerError),
   )
-
   use <- bool.lazy_guard(list.is_empty(peers), return: fn() {
     io.println("No peers") |> Ok
   })
   let assert [first, ..] = peers
-
   use endpoint <- try(new_endpoint(first) |> replace_error(InvalidEndpoint))
 
-  use #(socket, peer_peer_id, _extension) <- try(
-    protocol.handshake(endpoint, magnet_info.info_hash, peer_id)
+  use #(socket, peer_peer_id) <- try(
+    protocol.handshake(endpoint, info_hash, peer_id)
     |> map_error(ProtocolError),
   )
+  let session = session.new_session(socket, peer_peer_id, session.NoMeta)
 
-  use extensions <- try(extension_handshake(socket, peer_peer_id))
-  // use session <- try(session.wait_unchoke(session) |> map_error(PeerError))
+  use #(_, extensions) <- try(
+    session.extension_handshake_back(session) |> map_error(PeerError),
+  )
 
   use metadata_extension_id <- try(
     extensions
@@ -324,11 +308,11 @@ fn cmd_magnet_handshake(magnet_link: String) -> Result(Nil, CmdError) {
 
 fn cmd_magnet_info(magnet_link: String) -> Result(Nil, CmdError) {
   use peer_id <- try(load_peer_id() |> map_error(FileError))
-  use magnet_info <- try(
+  use #(tracker_url, info_hash) <- try(
     torrent.parse_magnet(magnet_link) |> replace_error(InvalidMagnetLink),
   )
   use peers <- try(
-    tracker.get_peers(magnet_info.announce, magnet_info.info_hash, 10, peer_id)
+    tracker.get_peers(tracker_url, info_hash, 10, peer_id)
     |> map_error(TrackerError),
   )
 
@@ -336,26 +320,102 @@ fn cmd_magnet_info(magnet_link: String) -> Result(Nil, CmdError) {
     io.println("No peers") |> Ok
   })
   let assert [first, ..] = peers
-
   use endpoint <- try(new_endpoint(first) |> replace_error(InvalidEndpoint))
 
-  use #(socket, peer_peer_id, _extension) <- try(
-    protocol.handshake(endpoint, magnet_info.info_hash, peer_id)
+  use #(socket, peer_peer_id) <- try(
+    protocol.handshake(endpoint, info_hash, peer_id)
     |> map_error(ProtocolError),
   )
+  let session = session.new_session(socket, peer_peer_id, session.NoMeta)
 
-  use extensions <- try(extension_handshake(socket, peer_peer_id))
-  // use session <- try(session.wait_unchoke(session) |> map_error(PeerError))
-  use extension_id <- try(
-    extensions
-    |> list.key_find("ut_metadata")
-    |> replace_error(CmdError("ut_metadata extension not supported by peer")),
+  use #(session, extensions) <- try(
+    session.extension_handshake_back(session) |> map_error(PeerError),
   )
+  use #(_, bencode) <- try(
+    session.extension_query_metadata(session, extensions)
+    |> map_error(PeerError),
+  )
+
+  use torrent <- try(
+    torrent.from_metadata(bencode, info_hash) |> map_error(DecodeError),
+  )
+  io.println("Tracker URL: " <> tracker_url)
+  io.println("Length: " <> int.to_string(torrent.length))
+
+  let encoded =
+    torrent.info_hash
+    |> bit_array.base16_encode
+    |> string.lowercase
+  io.println("Info Hash: " <> encoded)
+  io.println("Piece Length: " <> int.to_string(torrent.piece_length))
+
+  let hashes =
+    torrent.pieces
+    |> list.map(bit_array.base16_encode)
+    |> list.map(string.lowercase)
+    |> string.join(with: "\n")
+
+  io.println("Piece Hashes: \n" <> hashes)
+  Ok(Nil)
+}
+
+fn cmd_magnet_download_piece(
+  download_path: String,
+  magnet_link: String,
+  piece_index_str: String,
+) -> Result(Nil, CmdError) {
+  use piece_index <- try(
+    int.parse(piece_index_str) |> replace_error(InvalidArguments),
+  )
+  use peer_id <- try(load_peer_id() |> map_error(FileError))
+  use #(tracker_url, info_hash) <- try(
+    torrent.parse_magnet(magnet_link) |> replace_error(InvalidMagnetLink),
+  )
+  use peers <- try(
+    tracker.get_peers(tracker_url, info_hash, 10, peer_id)
+    |> map_error(TrackerError),
+  )
+
+  use <- bool.lazy_guard(list.is_empty(peers), return: fn() {
+    io.println("No peers") |> Ok
+  })
+  let assert [first, ..] = peers
+  use endpoint <- try(new_endpoint(first) |> replace_error(InvalidEndpoint))
+
+  let piece = torrent.PieceIndex(piece_index)
+
+  use #(socket, peer_peer_id) <- try(
+    protocol.handshake(endpoint, info_hash, peer_id)
+    |> result.map_error(ProtocolError),
+  )
+  let session = session.new_session(socket, peer_peer_id, session.NoMeta)
+  download.download_piece(download_path, piece, session)
+  |> map_error(TorrentError)
+}
+
+fn cmd_magnet_download(
+  download_path: String,
+  magnet_link: String,
+) -> Result(Nil, CmdError) {
+  use peer_id <- try(load_peer_id() |> map_error(FileError))
+  use #(tracker_url, info_hash) <- try(
+    torrent.parse_magnet(magnet_link) |> replace_error(InvalidMagnetLink),
+  )
+  use peers <- try(
+    tracker.get_peers(tracker_url, info_hash, 10, peer_id)
+    |> map_error(TrackerError),
+  )
+  use endpoints <- try(
+    list.try_map(peers, fn(endpoint) {
+      new_endpoint(endpoint) |> replace_error(InvalidEndpoint)
+    }),
+  )
+  let magnet = download.Magnet(info_hash)
   use _ <- try(
-    extension.send_metadata_request(socket, extension_id)
-    |> map_error(ProtocolError),
+    download.download_torrent(download_path, endpoints, magnet, peer_id)
+    |> map_error(TorrentError),
   )
-
+  io.println("download complete")
   Ok(Nil)
 }
 
